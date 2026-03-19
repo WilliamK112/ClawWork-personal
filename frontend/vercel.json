@@ -1,5 +1,6 @@
 {
+  "buildCommand": "VITE_STATIC_DATA=true npm run build",
   "rewrites": [
-    { "source": "/(.*)", "destination": "/index.html" }
+    { "source": "/((?!api|ws|assets|data|vite.svg).*)", "destination": "/index.html" }
   ]
 }
