@@ -421,6 +421,22 @@ def gen_settings():
     write_json(OUT_PATH / "settings" / "displaying-names.json", names)
 
 
+def gen_trading_config():
+    """Emit static active trading agents config used by frontend in STATIC mode."""
+    cfg_file = REPO_ROOT / "livebench" / "configs" / "active_trading_agents.json"
+    payload = {"active_agents": []}
+    if cfg_file.exists():
+        with open(cfg_file, encoding="utf-8") as f:
+            raw = json.load(f)
+        if isinstance(raw, list):
+            payload["active_agents"] = [str(x).strip() for x in raw if str(x).strip()]
+        elif isinstance(raw, dict):
+            agents = raw.get("active_agents", [])
+            payload["active_agents"] = [str(x).strip() for x in agents if str(x).strip()]
+
+    write_json(OUT_PATH / "trading" / "active-agents.json", payload)
+
+
 def main():
     print(f"Generating static data from {DATA_PATH}")
     print(f"Output: {OUT_PATH}\n")
@@ -429,6 +445,7 @@ def main():
     gen_leaderboard()
     gen_artifacts()
     gen_settings()
+    gen_trading_config()
 
     for agent_dir in agent_dirs():
         if not read_jsonl(agent_dir / "economic" / "balance.jsonl"):

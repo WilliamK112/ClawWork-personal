@@ -19,8 +19,21 @@ from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import glob
+from dotenv import load_dotenv
+
+# Ensure .env at project root is loaded so Alpaca env vars are available
+PROJECT_ROOT = Path(__file__).parent.parent.parent
+load_dotenv(PROJECT_ROOT / ".env")
+
+try:
+    # When running as a package (uvicorn livebench.api.server:app)
+    from .alpaca_routes import router as alpaca_router
+except ImportError:  # pragma: no cover - script-style fallback
+    # When running this file directly: python server.py
+    from livebench.api.alpaca_routes import router as alpaca_router
 
 app = FastAPI(title="LiveBench API", version="1.0.0")
+app.include_router(alpaca_router)
 
 # Enable CORS for frontend
 app.add_middleware(
@@ -34,6 +47,7 @@ app.add_middleware(
 # Data path
 DATA_PATH = Path(__file__).parent.parent / "data" / "agent_data"
 HIDDEN_AGENTS_PATH = Path(__file__).parent.parent / "data" / "hidden_agents.json"
+ACTIVE_TRADING_AGENTS_PATH = Path(__file__).parent.parent / "configs" / "active_trading_agents.json"
 
 # Task value lookup (task_id -> task_value_usd)
 _TASK_VALUES_PATH = Path(__file__).parent.parent.parent / "scripts" / "task_value_estimates" / "task_values.jsonl"
@@ -66,6 +80,87 @@ def _load_task_values() -> tuple:
 
 
 TASK_VALUES, TASK_POOL = _load_task_values()
+
+
+def _load_active_trading_agents() -> Optional[set[str]]:
+    """Return configured active trading agent signatures, or None when unset."""
+    if not ACTIVE_TRADING_AGENTS_PATH.exists():
+        return None
+
+    try:
+        payload = json.loads(ACTIVE_TRADING_AGENTS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+    if isinstance(payload, list):
+        agents = payload
+    elif isinstance(payload, dict):
+        agents = payload.get("active_agents", [])
+    else:
+        return None
+
+    valid = {str(a).strip() for a in agents if str(a).strip()}
+    return valid or None
+
+
+def _read_jsonl_events(path: Path) -> list:
+    events = []
+    if not path.exists():
+        return events
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                events.append(json.loads(s))
+            except json.JSONDecodeError:
+                continue
+    return events
+
+
+def _latest_preflight_event() -> tuple[Optional[dict], list]:
+    """Return latest preflight event and scanned events (newest-first files)."""
+    audit_dir = Path(__file__).parent.parent / "data" / "audit"
+    if not audit_dir.exists():
+        return None, []
+
+    files = sorted(audit_dir.glob("preflight-*.jsonl"), key=lambda p: p.name, reverse=True)
+    scanned: list = []
+    for f in files[:2]:  # today then previous day is enough for lightweight endpoint
+        events = _read_jsonl_events(f)
+        scanned.extend(events)
+        if events:
+            # latest valid line in newest file wins
+            return events[-1], scanned
+    return None, scanned
+
+
+def _derive_active_fallback_route(scanned_events: list, latest_event: dict) -> str:
+    if not latest_event:
+        return "none"
+
+    # Detect e2b->boxlite recovery when a recent failure due to missing template
+    # is followed by a pass under boxlite.
+    latest_provider = (latest_event.get("sandbox_provider") or "").lower()
+    latest_status = (latest_event.get("status") or "").lower()
+    failures = [str(x).lower() for x in (latest_event.get("failures") or [])]
+
+    if latest_status == "passed" and latest_provider == "boxlite":
+        # look backward for recent e2b template missing failure
+        for ev in reversed(scanned_events[:-1]):
+            if (ev.get("event_type") or "") != "preflight":
+                continue
+            ev_provider = (ev.get("sandbox_provider") or "").lower()
+            ev_status = (ev.get("status") or "").lower()
+            ev_failures = " ".join([str(x).lower() for x in (ev.get("failures") or [])])
+            if ev_provider == "e2b" and ev_status == "failed" and "e2b_template_id" in ev_failures:
+                return "e2b->boxlite"
+
+    if any("e2b_template_id" in f for f in failures):
+        return "e2b->boxlite"
+
+    return "none"
 
 
 def _load_task_completions_by_task_id(agent_dir: Path) -> dict:
@@ -193,10 +288,23 @@ async def root():
     }
 
 
+@app.get("/api/preflight/latest")
+async def get_preflight_latest():
+    """Return latest preflight artifact for dashboard ingestion."""
+    latest, scanned = _latest_preflight_event()
+    if not latest:
+        raise HTTPException(status_code=404, detail="No preflight artifact found")
+
+    payload = dict(latest)
+    payload["active_fallback_route"] = _derive_active_fallback_route(scanned, latest)
+    return payload
+
+
 @app.get("/api/agents")
 async def get_agents():
     """Get list of all agents with their current status"""
     agents = []
+    active_agents = _load_active_trading_agents()
 
     if not DATA_PATH.exists():
         return {"agents": []}
@@ -204,6 +312,8 @@ async def get_agents():
     for agent_dir in DATA_PATH.iterdir():
         if agent_dir.is_dir():
             signature = agent_dir.name
+            if active_agents is not None and signature not in active_agents:
+                continue
 
             # Get latest balance
             balance_file = agent_dir / "economic" / "balance.jsonl"
@@ -289,6 +399,50 @@ async def get_agent_details(signature: str):
     latest_balance = balance_history[-1] if balance_history else {}
     latest_decision = decisions[-1] if decisions else {}
 
+    # Parse latest error and derive provider-route recommendation snippet
+    latest_error = None
+    provider_recommendation = None
+    errors_file = agent_dir / "logs" / "errors.jsonl"
+    if errors_file.exists():
+        try:
+            last_nonempty = None
+            with open(errors_file, "r") as f:
+                for line in f:
+                    s = line.strip()
+                    if s:
+                        last_nonempty = s
+            if last_nonempty:
+                err = json.loads(last_nonempty)
+                latest_error = {
+                    "type": (err.get("exception") or {}).get("type"),
+                    "message": (err.get("exception") or {}).get("message"),
+                    "at": err.get("timestamp"),
+                }
+                msg = ((err.get("exception") or {}).get("message") or "").lower()
+                if "model_not_found" in msg or "does not exist or you do not have access" in msg:
+                    provider_recommendation = {
+                        "severity": "error",
+                        "title": "Model route unavailable on current provider",
+                        "hint": "Requested model is not available/authorized. Use provider model list to select a reachable model or switch provider/base URL.",
+                        "action": "Try fallback route (e.g. gpt-4o-mini) or configure ATIC provider base/key for atic-brain."
+                    }
+                elif "insufficient_quota" in msg or "exceeded your current quota" in msg:
+                    provider_recommendation = {
+                        "severity": "warn",
+                        "title": "Billing/quota limit reached",
+                        "hint": "Provider rejected requests due to quota/billing limits.",
+                        "action": "Top up billing or reduce model cost; then rerun via run_safe.sh."
+                    }
+                elif "hypervisor.framework" in msg or "kern.hv_support" in msg or "failed to initialize default boxliteruntime" in msg:
+                    provider_recommendation = {
+                        "severity": "warn",
+                        "title": "Local virtualization not available for BoxLite",
+                        "hint": "Host cannot start BoxLite runtime (Hypervisor.framework / virtualization support issue).",
+                        "action": "Use E2B with valid E2B_TEMPLATE_ID, or run no-sandbox fallback. On macOS check: sysctl kern.hv_support"
+                    }
+        except Exception:
+            pass
+
     return {
         "signature": signature,
         "current_status": {
@@ -304,7 +458,9 @@ async def get_agent_details(signature: str):
         },
         "balance_history": balance_history,
         "decisions": decisions,
-        "evaluation_scores": evaluation_scores
+        "evaluation_scores": evaluation_scores,
+        "latest_error": latest_error,
+        "provider_recommendation": provider_recommendation,
     }
 
 
@@ -509,12 +665,15 @@ async def get_leaderboard():
         return {"agents": []}
 
     agents = []
+    active_agents = _load_active_trading_agents()
 
     for agent_dir in DATA_PATH.iterdir():
         if not agent_dir.is_dir():
             continue
 
         signature = agent_dir.name
+        if active_agents is not None and signature not in active_agents:
+            continue
 
         # Load balance history
         balance_file = agent_dir / "economic" / "balance.jsonl"
@@ -552,12 +711,14 @@ async def get_leaderboard():
         task_completions_by_date = _load_task_completions_by_date(agent_dir)
 
         # Strip balance history to essential fields, exclude initialization
+        # Keep timestamp so frontend can render a real time-axis timeline.
         stripped_history = []
         for entry in balance_history:
             if entry.get("date") == "initialization":
                 continue
             stripped_history.append({
                 "date": entry.get("date"),
+                "timestamp": entry.get("timestamp"),
                 "balance": entry.get("balance", 0),
             })
 
@@ -677,6 +838,18 @@ async def get_artifact_file(path: str = Query(...)):
     ext = file_path.suffix.lower()
     media_type = ARTIFACT_MIME_TYPES.get(ext, 'application/octet-stream')
     return FileResponse(file_path, media_type=media_type)
+
+
+@app.get("/api/trading/active-agents")
+async def get_active_trading_agents():
+    """Get currently configured active trading agents."""
+    active_agents = _load_active_trading_agents()
+    agents = sorted(active_agents) if active_agents else []
+    return {
+        "active_agents": agents,
+        "count": len(agents),
+        "source": str(ACTIVE_TRADING_AGENTS_PATH),
+    }
 
 
 @app.get("/api/settings/hidden-agents")

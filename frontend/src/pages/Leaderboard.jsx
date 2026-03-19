@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom'
 import { Trophy, ArrowUpDown, TrendingUp, TrendingDown, RefreshCw, AlertCircle, Maximize2, Minimize2 } from 'lucide-react'
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from 'recharts'
 import { motion, AnimatePresence } from 'framer-motion'
-import { fetchLeaderboard as apiFetchLeaderboard } from '../api'
+import { fetchLeaderboard as apiFetchLeaderboard, fetchActiveTradingAgents } from '../api'
 import { useDisplayName } from '../DisplayNamesContext'
 
 const NEON_COLORS = [
@@ -86,7 +86,7 @@ const statusColor  = (s) => ({ thriving: '#34d399', stable: '#60a5fa', strugglin
 const Ticker = ({ agents, dn = (s) => s }) => {
   if (!agents.length) return null
   const items = agents.map((a, i) => ({
-    text: `${dn(a.signature)}  $${a.current_balance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+    text: `${dn(a.signature)}  $${a.net_worth.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
     symbol: statusSymbol(a.survival_status),
     color: NEON_COLORS[i % NEON_COLORS.length],
     statusColor: statusColor(a.survival_status),
@@ -186,9 +186,10 @@ const Leaderboard = ({ hiddenAgents = new Set() }) => {
   const [data, setData]           = useState(null)
   const [loading, setLoading]     = useState(true)
   const [error, setError]         = useState(null)
-  const [sortKey, setSortKey]     = useState('current_balance')
+  const [sortKey, setSortKey]     = useState('net_worth')
   const [sortAsc, setSortAsc]     = useState(false)
   const [lastFetch, setLastFetch] = useState(Date.now())
+  const [activeTradingAgents, setActiveTradingAgents] = useState([])
 
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [chartFlexRatio, setChartFlexRatio] = useState(40) // % of chart+table area
@@ -211,16 +212,19 @@ const Leaderboard = ({ hiddenAgents = new Set() }) => {
 
   const fetchLeaderboard = async () => {
     try {
-      const result = await apiFetchLeaderboard()
+      const [result, activeCfg] = await Promise.all([
+        apiFetchLeaderboard(),
+        fetchActiveTradingAgents().catch(() => ({ active_agents: [] })),
+      ])
 
       // Detect balance changes → flash
       const newFlash = {}
       result.agents?.forEach(a => {
         const prev = prevBalances.current[a.signature]
-        if (prev !== undefined && prev !== a.current_balance) {
-          newFlash[a.signature] = a.current_balance > prev ? 'up' : 'down'
+        if (prev !== undefined && prev !== a.net_worth) {
+          newFlash[a.signature] = a.net_worth > prev ? 'up' : 'down'
         }
-        prevBalances.current[a.signature] = a.current_balance
+        prevBalances.current[a.signature] = a.net_worth
       })
       if (Object.keys(newFlash).length) {
         setFlashMap(newFlash)
@@ -228,6 +232,7 @@ const Leaderboard = ({ hiddenAgents = new Set() }) => {
       }
 
       setData(result)
+      setActiveTradingAgents(Array.isArray(activeCfg?.active_agents) ? activeCfg.active_agents : [])
       setLastFetch(Date.now())
       setError(null)
     } catch (err) {
@@ -239,75 +244,79 @@ const Leaderboard = ({ hiddenAgents = new Set() }) => {
 
   const visibleData = useMemo(() => {
     if (!data?.agents) return []
-    return data.agents.filter(a => !hiddenAgents.has(a.signature))
-  }, [data, hiddenAgents])
+
+    const activeSigs = new Set(activeTradingAgents)
+    if (!activeSigs.size) return data.agents
+
+    return data.agents.filter(a => activeSigs.has(a.signature))
+  }, [data, activeTradingAgents])
 
   const sortedAgents = useMemo(() => {
     if (!visibleData.length) return []
+
+    // Keep actively trading agents on top; parked/idle agents go to the bottom.
+    const rankActivity = (a) => {
+      if (a.current_activity === 'trading') return 0
+      if (a.current_activity === 'parked') return 1
+      return 2
+    }
+
     return [...visibleData].sort((a, b) => {
+      const aa = rankActivity(a)
+      const bb = rankActivity(b)
+      if (aa !== bb) return aa - bb
+
       const aVal = a[sortKey] ?? -Infinity
       const bVal = b[sortKey] ?? -Infinity
       return sortAsc ? aVal - bVal : bVal - aVal
     })
   }, [visibleData, sortKey, sortAsc])
 
-  // Per-agent cumulative wall-clock hours and pay-rate metrics
-  // Uses wc_series from task_completions.jsonl (every entry has wall_clock_seconds)
+  // Per-agent pay-rate metrics still use wc_series (task completion wall-clock)
   const agentTimeMetrics = useMemo(() => {
     const result = {}
     for (const agent of visibleData) {
       let cumSecs = 0
       const series = agent.wc_series || []
-      // Start with initial balance at hour 0
-      const points = [{ cumHours: 0, balance: agent.initial_balance, date: 'start', timestamp: null }]
-      for (const e of series) {
-        cumSecs += e.wall_clock_seconds
-        points.push({ cumHours: cumSecs / 3600, balance: e.balance, date: e.date, timestamp: e.timestamp })
-      }
+      for (const e of series) cumSecs += e.wall_clock_seconds
       const totalHours = cumSecs / 3600
       const hourlyRate = totalHours > 0 ? agent.total_work_income / totalHours : null
-      result[agent.signature] = { points, totalHours, hourlyRate }
+      result[agent.signature] = { totalHours, hourlyRate }
     }
     return result
   }, [visibleData])
 
+  // Real timeline mode: x-axis uses timestamp from balance history
   const chartData = useMemo(() => {
     if (!visibleData.length) return []
 
-    // ── Wall-clock mode: cumulative work hours per agent ─────────────
-    // Each agent gets data points only at its own cumHour breakpoints
-    const allHourPoints = new Set()
-    const agentHourSets = {}
-    for (const agent of visibleData) {
-      const hourSet = new Set()
-      agentTimeMetrics[agent.signature].points.forEach(p => {
-        const h = parseFloat(p.cumHours.toFixed(3))
-        allHourPoints.add(h)
-        hourSet.add(h)
-      })
-      agentHourSets[agent.signature] = hourSet
-    }
-    const hours = [...allHourPoints].sort((a, b) => a - b)
+    const allTimes = new Set()
+    const perAgent = {}
 
-    // Build lookup: agent → cumHours → balance
-    const agentHourLookup = {}
+    for (const agent of visibleData) {
+      const hist = (agent.balance_history || []).filter(h => h.date !== 'initialization')
+      const points = hist.map((h, idx) => {
+        const x = h.timestamp || `${h.date || 'unknown'}-${String(idx).padStart(4, '0')}`
+        return { x, balance: h.balance }
+      })
+      perAgent[agent.signature] = points
+      points.forEach(p => allTimes.add(p.x))
+    }
+
+    const times = [...allTimes].sort((a, b) => String(a).localeCompare(String(b)))
+    const lookup = {}
     for (const agent of visibleData) {
       const lk = {}
-      agentTimeMetrics[agent.signature].points.forEach(p => {
-        lk[parseFloat(p.cumHours.toFixed(3))] = p.balance
-      })
-      agentHourLookup[agent.signature] = lk
+      for (const p of perAgent[agent.signature]) lk[p.x] = p.balance
+      lookup[agent.signature] = lk
     }
 
-    return hours.map(h => {
-      const row = { x: h }
-      for (const agent of visibleData) {
-        // Only set value at this agent's own breakpoints — no interpolation
-        row[agent.signature] = agentHourLookup[agent.signature][h] ?? null
-      }
+    return times.map(t => {
+      const row = { x: t }
+      for (const agent of visibleData) row[agent.signature] = lookup[agent.signature][t] ?? null
       return row
     })
-  }, [visibleData, agentTimeMetrics])
+  }, [visibleData])
 
   // For each agent, precompute the last known (non-null) balance at every chart row index.
   // This lets the tooltip show all agents' balances at any hovered x position.
@@ -381,7 +390,10 @@ const Leaderboard = ({ hiddenAgents = new Set() }) => {
   // ── Dark tooltip ────────────────────────────────────────────────────────
   const DarkTooltip = ({ active, payload, label }) => {
     if (!active || !payload?.length) return null
-    const xLabel = `${Number(label).toFixed(2)}h elapsed`
+    const asDate = new Date(label)
+    const xLabel = Number.isNaN(asDate.getTime())
+      ? String(label)
+      : `${asDate.toLocaleDateString()} ${asDate.toLocaleTimeString()}`
     // Find the chart row index for this label
     const rowIdx = chartData.findIndex(r => r.x === label)
     return (
@@ -405,7 +417,7 @@ const Leaderboard = ({ hiddenAgents = new Set() }) => {
 
   // ── Rank cell ───────────────────────────────────────────────────────────
   const RankCell = ({ index }) => {
-    const isBalance = sortKey === 'current_balance' && !sortAsc
+    const isBalance = sortKey === 'net_worth' && !sortAsc
     if (!isBalance) return <span className="text-slate-400 font-mono text-xs">#{index + 1}</span>
     if (index === 0) return <span style={{ animation: 'rankGlow 2s ease-in-out infinite', fontSize: 18 }}>🥇</span>
     if (index === 1) return <span style={{ fontSize: 18 }}>🥈</span>
@@ -477,7 +489,13 @@ const Leaderboard = ({ hiddenAgents = new Set() }) => {
               <LiveBadge />
             </div>
             <div className="flex items-center gap-3 text-white/80 text-sm">
-              <span>{visibleData.length} agent{visibleData.length !== 1 ? 's' : ''} competing</span>
+              <span>{visibleData.length} active agent{visibleData.length !== 1 ? 's' : ''}</span>
+              {activeTradingAgents.length > 0 && (
+                <>
+                  <span>·</span>
+                  <span className="font-mono text-white/90">{activeTradingAgents.join(', ')}</span>
+                </>
+              )}
               <span>·</span>
               <LastUpdated lastFetchTime={lastFetch} />
             </div>
@@ -487,7 +505,7 @@ const Leaderboard = ({ hiddenAgents = new Set() }) => {
               <p className="text-xs text-white/70 uppercase tracking-widest mb-0.5">Top Performer</p>
               <p className={`font-bold ${isFullscreen ? 'text-sm' : 'text-lg'}`}>{dn(topAgent.signature)}</p>
               <p className="text-sm text-white/90 font-mono">
-                ${topAgent.current_balance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                ${topAgent.net_worth.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
               </p>
             </div>
           )}
@@ -536,13 +554,13 @@ const Leaderboard = ({ hiddenAgents = new Set() }) => {
             </div>
             <div className="flex items-center gap-3">
               <span className="text-xs font-mono text-slate-500">{chartData.length} data points</span>
-              {/* Wall-clock indicator */}
+              {/* Timeline indicator */}
               <span
                 className="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold border bg-cyan-950/60 border-cyan-600/60 text-cyan-300"
-                title="X-axis shows cumulative wall-clock hours of work"
+                title="X-axis shows real timeline timestamps"
               >
-                <span className="text-base leading-none">⏱</span>
-                Wall-clock hrs
+                <span className="text-base leading-none">🕒</span>
+                Timeline
               </span>
             </div>
           </div>
@@ -557,8 +575,12 @@ const Leaderboard = ({ hiddenAgents = new Set() }) => {
                   tick={{ fontSize: 10, fill: '#475569' }}
                   interval={Math.max(0, Math.floor(chartData.length / 10) - 1)}
                   angle={-45} textAnchor="end" height={isFullscreen ? 40 : 60}
-                  tickFormatter={(d) => `${Number(d).toFixed(1)}h`}
-                  label={{ value: 'Cumulative work hours', position: 'insideBottomRight', offset: -4, fill: '#475569', fontSize: 10 }}
+                  tickFormatter={(d) => {
+                    const dt = new Date(d)
+                    if (Number.isNaN(dt.getTime())) return String(d).slice(0, 10)
+                    return `${String(dt.getHours()).padStart(2, '0')}:${String(dt.getMinutes()).padStart(2, '0')}`
+                  }}
+                  label={{ value: 'Timeline (HH:MM)', position: 'insideBottomRight', offset: -4, fill: '#475569', fontSize: 10 }}
                   axisLine={{ stroke: 'rgba(255,255,255,0.08)' }}
                   tickLine={{ stroke: 'rgba(255,255,255,0.08)' }}
                 />
@@ -650,7 +672,7 @@ const Leaderboard = ({ hiddenAgents = new Set() }) => {
                 <th className="px-4 py-3 text-left text-xs font-semibold text-slate-500 uppercase tracking-wider">Rank</th>
                 <th className="px-4 py-3 text-left text-xs font-semibold text-slate-500 uppercase tracking-wider">Agent</th>
                 <DarkSortHeader label="Starter"     sortKey="initial_balance"   currentKey={sortKey} asc={sortAsc} onSort={handleSort} />
-                <DarkSortHeader label="Balance"     sortKey="current_balance"   currentKey={sortKey} asc={sortAsc} onSort={handleSort} />
+                <DarkSortHeader label="Net Worth"   sortKey="net_worth"         currentKey={sortKey} asc={sortAsc} onSort={handleSort} />
                 <DarkSortHeader label="% Change"    sortKey="pct_change"        currentKey={sortKey} asc={sortAsc} onSort={handleSort} />
                 <DarkSortHeader label="Income"      sortKey="total_work_income" currentKey={sortKey} asc={sortAsc} onSort={handleSort} />
                 <DarkSortHeader label="Cost"        sortKey="total_token_cost"  currentKey={sortKey} asc={sortAsc} onSort={handleSort} />
@@ -668,7 +690,7 @@ const Leaderboard = ({ hiddenAgents = new Set() }) => {
                   const colorIdx = visibleData.findIndex(a => a.signature === agent.signature)
                   const color = NEON_COLORS[colorIdx % NEON_COLORS.length]
                   const flash = flashMap[agent.signature]
-                  const isTop = index === 0 && sortKey === 'current_balance' && !sortAsc
+                  const isTop = index === 0 && sortKey === 'net_worth' && !sortAsc
                   const isThriving = agent.survival_status === 'thriving'
                   const isCritical = ['critical', 'bankrupt'].includes(agent.survival_status)
 
@@ -730,10 +752,10 @@ const Leaderboard = ({ hiddenAgents = new Set() }) => {
                         ${agent.initial_balance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                       </td>
 
-                      {/* Current balance */}
+                      {/* Net worth */}
                       <td className="px-4 py-3.5">
                         <span className="font-mono text-sm font-bold" style={{ color: isTop ? '#fbbf24' : '#e2e8f0' }}>
-                          ${agent.current_balance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                          ${agent.net_worth.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                         </span>
                       </td>
 
@@ -787,7 +809,18 @@ const Leaderboard = ({ hiddenAgents = new Set() }) => {
 
                       {/* Status */}
                       <td className="px-4 py-3.5">
-                        <PulseStatus status={agent.survival_status} />
+                        <div className="flex items-center gap-2">
+                          <PulseStatus status={agent.survival_status} />
+                          <span className={`px-2 py-0.5 rounded-full text-[10px] border ${
+                            agent.current_activity === 'trading'
+                              ? 'bg-cyan-950/60 text-cyan-300 border-cyan-700/60'
+                              : agent.current_activity === 'parked'
+                              ? 'bg-slate-800 text-slate-300 border-slate-600/60'
+                              : 'bg-slate-900 text-slate-500 border-slate-700/60'
+                          }`}>
+                            {agent.current_activity || 'idle'}
+                          </span>
+                        </div>
                       </td>
                     </motion.tr>
                   )

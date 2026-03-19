@@ -41,11 +41,40 @@ jobs:
         working-directory: ./frontend
         run: npm ci
 
+      - name: UI audit (dead buttons/routes guard)
+        working-directory: ./frontend
+        run: npm run audit:ui
+
       - name: Build
         working-directory: ./frontend
         run: npm run build
         env:
           VITE_STATIC_DATA: 'true'
+
+      - name: Smoke test routes (runtime)
+        working-directory: ./frontend
+        run: |
+          npm run preview -- --host 127.0.0.1 --port 4173 >/tmp/vite-preview.log 2>&1 &
+          PREVIEW_PID=$!
+          cleanup() {
+            kill $PREVIEW_PID || true
+          }
+          trap cleanup EXIT
+
+          # wait for preview server
+          for i in {1..30}; do
+            if curl -fsS http://127.0.0.1:4173/ >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+
+          # core routes should resolve (SPA fallback)
+          curl -fsS http://127.0.0.1:4173/ >/dev/null
+          curl -fsS http://127.0.0.1:4173/dashboard >/dev/null
+          curl -fsS http://127.0.0.1:4173/artifacts >/dev/null
+          curl -fsS http://127.0.0.1:4173/work >/dev/null
+          curl -fsS http://127.0.0.1:4173/learning >/dev/null
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3

@@ -31,6 +31,9 @@ export const fetchAgentEconomic = (sig) =>
 export const fetchAgentTasks = (sig) =>
   get(STATIC ? staticUrl(`agents/${encodeURIComponent(sig)}/tasks.json`) : liveUrl(`agents/${sig}/tasks`))
 
+export const fetchPreflightLatest = () =>
+  get(STATIC ? staticUrl('preflight/latest.json') : liveUrl('preflight/latest'))
+
 export const fetchAgentLearning = (sig) =>
   get(STATIC ? staticUrl(`agents/${encodeURIComponent(sig)}/learning.json`) : liveUrl(`agents/${sig}/learning`))
 
@@ -39,6 +42,9 @@ export const fetchHiddenAgents = () =>
 
 export const fetchDisplayNames = () =>
   get(STATIC ? staticUrl('settings/displaying-names.json') : liveUrl('settings/displaying-names'))
+
+export const fetchActiveTradingAgents = () =>
+  get(STATIC ? staticUrl('trading/active-agents.json') : liveUrl('trading/active-agents'))
 
 export const fetchArtifacts = () =>
   get(STATIC ? staticUrl('artifacts.json') : liveUrl('artifacts/random?count=30'))
