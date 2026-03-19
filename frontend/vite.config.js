@@ -4,7 +4,10 @@ import react from '@vitejs/plugin-react'
 // https://vitejs.dev/config/
 export default defineConfig(({ command }) => ({
   plugins: [react()],
-  base: command === 'build' ? '/ClawWork/' : '/',
+  // GitHub Pages needs /ClawWork/, Vercel needs /
+  base: command === 'build'
+    ? (process.env.VERCEL ? '/' : '/ClawWork/')
+    : '/',
   server: {
     port: 3000,
     proxy: {
